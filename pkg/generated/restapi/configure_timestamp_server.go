@@ -19,6 +19,7 @@ package restapi
 
 import (
 	"crypto/tls"
+	"fmt"
 	"math"
 	"net/http"
 	"strconv"
@@ -32,6 +33,8 @@ import (
 	"github.com/rs/cors"
 	"github.com/spf13/viper"
 	"github.com/urfave/negroni"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 
 	pkgapi "github.com/sigstore/timestamp-authority/v2/pkg/api"
 	"github.com/sigstore/timestamp-authority/v2/pkg/generated/restapi/operations"
@@ -97,12 +100,73 @@ func setupMiddlewares(handler http.Handler) http.Handler {
 	return handler
 }
 
-// We need this type to act as an adapter between zap and the middleware request logger.
-type logAdapter struct {
+type httpRequestFields struct {
+	requestMethod string
+	requestURL    string
+	requestSize   int64
+	status        int
+	responseSize  int
+	userAgent     string
+	remoteIp      string //revive:disable:var-naming
+	latency       time.Duration
+	protocol      string
 }
 
-func (l *logAdapter) Print(v ...any) {
-	log.Logger.Info(v...)
+func (h *httpRequestFields) MarshalLogObject(enc zapcore.ObjectEncoder) error {
+	enc.AddString("requestMethod", h.requestMethod)
+	enc.AddString("requestUrl", h.requestURL)
+	enc.AddString("requestSize", fmt.Sprintf("%d", h.requestSize))
+	enc.AddInt("status", h.status)
+	enc.AddString("responseSize", fmt.Sprintf("%d", h.responseSize))
+	enc.AddString("userAgent", h.userAgent)
+	enc.AddString("remoteIp", h.remoteIp)
+	enc.AddString("latency", fmt.Sprintf("%.9fs", h.latency.Seconds())) // formatted per GCP expectations
+	enc.AddString("protocol", h.protocol)
+	return nil
+}
+
+// We need this type to act as an adapter between zap and the middleware request logger.
+type zapLogEntry struct {
+	r *http.Request
+}
+
+func (z *zapLogEntry) Write(status, bytes int, _ http.Header, elapsed time.Duration, extra any) {
+	var fields []any
+
+	// follows https://cloud.google.com/logging/docs/reference/v2/rest/v2/LogEntry as a convention
+	// append HTTP Request / Response Information
+	scheme := "http"
+	if z.r.TLS != nil {
+		scheme = "https"
+	}
+	httpRequestObj := &httpRequestFields{
+		requestMethod: z.r.Method,
+		requestURL:    fmt.Sprintf("%s://%s%s", scheme, z.r.Host, z.r.RequestURI),
+		requestSize:   z.r.ContentLength,
+		status:        status,
+		responseSize:  bytes,
+		userAgent:     z.r.Header.Get("User-Agent"),
+		remoteIp:      z.r.RemoteAddr,
+		latency:       elapsed,
+		protocol:      z.r.Proto,
+	}
+	fields = append(fields, zap.Object("httpRequest", httpRequestObj))
+	if extra != nil {
+		fields = append(fields, zap.Any("extra", extra))
+	}
+
+	log.ContextLogger(z.r.Context()).With(fields...).Info("completed request")
+}
+
+func (z *zapLogEntry) Panic(v any, stack []byte) {
+	fields := []any{zap.String("message", fmt.Sprintf("%v\n%v", v, string(stack)))}
+	log.ContextLogger(z.r.Context()).With(fields...).Errorf("panic detected: %v", v)
+}
+
+type logFormatter struct{}
+
+func (l *logFormatter) NewLogEntry(r *http.Request) middleware.LogEntry {
+	return &zapLogEntry{r}
 }
 
 const pingPath = "/ping"
@@ -147,8 +211,7 @@ func limitRequestBody(next http.Handler) http.Handler {
 // The middleware configuration happens before anything, this middleware also applies to serving the swagger.json document.
 // So this is a good place to plug in a panic handling middleware, logging and metrics.
 func setupGlobalMiddleware(handler http.Handler) http.Handler {
-	middleware.DefaultLogger = middleware.RequestLogger(
-		&middleware.DefaultLogFormatter{Logger: &logAdapter{}})
+	middleware.DefaultLogger = middleware.RequestLogger(&logFormatter{})
 	returnHandler := middleware.Logger(handler)
 	returnHandler = middleware.Recoverer(returnHandler)
 	returnHandler = middleware.Heartbeat(pingPath)(returnHandler)
@@ -167,7 +230,7 @@ func setupGlobalMiddleware(handler http.Handler) http.Handler {
 		ctx := r.Context()
 		r = r.WithContext(log.WithRequestID(ctx, middleware.GetReqID(ctx)))
 		defer func() {
-			_ = log.RequestIDLogger(r).Sync()
+			_ = log.ContextLogger(ctx).Sync()
 		}()
 
 		returnHandler.ServeHTTP(w, r)
@@ -236,14 +299,20 @@ func cacheForDay(handler http.Handler) http.Handler {
 }
 
 func logAndServeError(w http.ResponseWriter, r *http.Request, err error) {
-	if apiErr, ok := err.(errors.Error); ok && apiErr.Code() < http.StatusInternalServerError {
-		log.RequestIDLogger(r).Warn(err)
+	ctx := r.Context()
+	if apiErr, ok := err.(errors.Error); ok {
+		code := apiErr.Code()
+		if code >= http.StatusBadRequest && code < http.StatusInternalServerError {
+			log.ContextLogger(ctx).Warnw(err.Error(), "code", code)
+		} else {
+			log.ContextLogger(ctx).Errorw(err.Error(), "code", code)
+		}
 	} else {
-		log.RequestIDLogger(r).Error(err)
+		log.ContextLogger(ctx).Error(err)
 	}
 	requestFields := map[string]any{}
 	if err := mapstructure.Decode(r, &requestFields); err == nil {
-		log.RequestIDLogger(r).Debug(requestFields)
+		log.ContextLogger(ctx).Debug(requestFields)
 	}
 	errors.ServeError(w, r, err)
 }
